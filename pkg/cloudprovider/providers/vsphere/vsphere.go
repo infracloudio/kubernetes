@@ -741,7 +741,7 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (di
 		}
 
 		// Get VM device list
-		_, vmDevices, _, err = getVirtualMachineDevices(ctx, vs.cfg, vs.client, vSphereInstance)
+		_, vmDevices, _, err = getVirtualMachineDevices(vs.cfg, ctx, vs.client, vSphereInstance)
 		if err != nil {
 			glog.Errorf("cannot get vmDevices for VM err=%s", err)
 			return "", "", fmt.Errorf("cannot get vmDevices for VM err=%s", err)
@@ -1442,7 +1442,7 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 		if scsiController == nil {
 			glog.Errorf("cannot find SCSI controller in VM")
 			// attempt clean up of scsi controller
-			cleanUpController(ctx, newSCSIController, vmDevices, virtualMachine)
+			cleanUpController(newSCSIController, vmDevices, virtualMachine, ctx)
 			return "", fmt.Errorf("cannot find SCSI controller in VM")
 		}
 	}
@@ -1540,7 +1540,7 @@ func createAndAttachSCSIControllerToVM(ctx context.Context, vm *object.VirtualMa
 		glog.V(1).Infof("cannot add SCSI controller to vm - %v", err)
 		// attempt clean up of scsi controller
 		if vmDevices, err := vm.Device(ctx); err == nil {
-			cleanUpController(ctx, newSCSIController, vmDevices, vm)
+			cleanUpController(newSCSIController, vmDevices, vm, ctx)
 		}
 		return nil, err
 	}
