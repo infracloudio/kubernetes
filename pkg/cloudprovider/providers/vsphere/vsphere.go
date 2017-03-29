@@ -21,12 +21,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/url"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/gcfg.v1"
 
@@ -1425,9 +1427,8 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 	// find SCSI controller of particular type from VM devices
 	scsiControllersOfRequiredType := getSCSIControllersOfType(vmDevices, diskControllerType)
 	scsiController := getAvailableSCSIController(scsiControllersOfRequiredType)
-	var newSCSIController types.BaseVirtualDevice
 	if scsiController == nil {
-		newSCSIController, err = createAndAttachSCSIControllerToVM(ctx, virtualMachine, diskControllerType)
+		_, err = createAndAttachSCSIControllerToVM(ctx, virtualMachine, diskControllerType)
 		if err != nil {
 			glog.Errorf("Failed to create SCSI controller for VM :%q with err: %+v", virtualMachine.Name(), err)
 			return "", err
@@ -1438,11 +1439,18 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 		if err != nil {
 			return "", err
 		}
-		scsiController = getSCSIController(vmDevices, diskControllerType)
+
+		// Get VM device list
+		_, vmDevices, _, err = getVirtualMachineDevices(vs.cfg, ctx, vs.client, virtualMachine.Name())
+		if err != nil {
+			glog.Errorf("cannot get vmDevices for VM err=%s", err)
+			return "", fmt.Errorf("cannot get vmDevices for VM err=%s", err)
+		}
+
+		scsiControllersOfRequiredType := getSCSIControllersOfType(vmDevices, diskControllerType)
+		scsiController := getAvailableSCSIController(scsiControllersOfRequiredType)
 		if scsiController == nil {
 			glog.Errorf("cannot find SCSI controller in VM")
-			// attempt clean up of scsi controller
-			cleanUpController(newSCSIController, vmDevices, virtualMachine, ctx)
 			return "", fmt.Errorf("cannot find SCSI controller in VM")
 		}
 	}
@@ -1459,12 +1467,16 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 
 	vmDiskPath := kubeVolsPath + volumeOptions.Name + ".vmdk"
 	disk := vmDevices.CreateDisk(scsiController, datastore.Reference(), vmDiskPath)
-	unitNumber, err := getNextUnitNumber(vmDevices, scsiController)
-	if err != nil {
-		glog.Errorf("cannot attach disk to VM, limit reached - %v.", err)
-		return "", err
-	}
-	*disk.UnitNumber = unitNumber
+	// unitNumber, err := getNextUnitNumber(vmDevices, scsiController)
+	// if err != nil {
+	// 	glog.Errorf("cannot attach disk to VM, limit reached - %v.", err)
+	// 	return "", err
+	// }
+	// *disk.UnitNumber = unitNumber
+	rand.Seed(time.Now().UTC().UnixNano())
+	unitNum := int32(rand.Intn(16))
+	glog.V(1).Infof("balu - unitNum used is %d", unitNum)
+	*disk.UnitNumber = unitNum
 	disk.CapacityInKB = int64(volumeOptions.CapacityKB)
 
 	backing := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
