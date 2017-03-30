@@ -895,11 +895,13 @@ func getSCSIControllers(vmDevices object.VirtualDeviceList) []*types.VirtualCont
 }
 
 func getAvailableSCSIController(scsiControllers []*types.VirtualController) *types.VirtualController {
+	scsiControllerCount := len(scsiControllers)
+	rand.Seed(time.Now().UTC().UnixNano())
+	i := rand.Intn(scsiControllerCount)
+
 	// get SCSI controller which has space for adding more devices
-	for _, controller := range scsiControllers {
-		if len(controller.Device) < SCSIControllerDeviceLimit {
-			return controller
-		}
+	if len(scsiControllers[i].Device) < SCSIControllerDeviceLimit {
+		return scsiControllers[i]
 	}
 	return nil
 }
@@ -1371,15 +1373,39 @@ func (vs *VSphere) createDummyVM(ctx context.Context, datacenter *object.Datacen
 		MemoryMB: 4,
 	}
 
-	// Create a new finder
-	f := find.NewFinder(vs.client.Client, true)
-	f.SetDatacenter(datacenter)
+	scsiConfigSpec := createMaxSCSIControllersForDummyVM()
+	virtualMachineConfigSpec.DeviceChange = scsiConfigSpec
+
+	// Get the resource pool for current node. This is where dummy VM will be created.
+	resourcePool, err := vs.getCurrentNodeResourcePool(ctx, datacenter)
+	if err != nil {
+		return nil, err
+	}
 
 	// Get the folder reference for global working directory where the dummy VM needs to be created.
 	vmFolder, err := getFolder(ctx, vs.client, vs.cfg.Global.Datacenter, vs.cfg.Global.WorkingDir)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get the folder reference for %q", vs.cfg.Global.WorkingDir)
+		return nil, fmt.Errorf("Failed to get the folder reference for %q with err: %+v", vs.cfg.Global.WorkingDir, err)
 	}
+
+	task, err := vmFolder.CreateVM(ctx, virtualMachineConfigSpec, resourcePool, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	dummyVMTaskInfo, err := task.WaitForResult(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	dummyVM := dummyVMTaskInfo.Result.(*object.VirtualMachine)
+	return dummyVM, nil
+}
+
+func (vs *VSphere) getCurrentNodeResourcePool(ctx context.Context, datacenter *object.Datacenter) (*object.ResourcePool, error) {
+	// Create a new finder
+	f := find.NewFinder(vs.client.Client, true)
+	f.SetDatacenter(datacenter)
 
 	vmRegex := vs.cfg.Global.WorkingDir + vs.localInstanceID
 	currentVM, err := f.VirtualMachine(ctx, vmRegex)
@@ -1399,18 +1425,40 @@ func (vs *VSphere) createDummyVM(ctx context.Context, datacenter *object.Datacen
 		return nil, err
 	}
 
-	task, err := vmFolder.CreateVM(ctx, virtualMachineConfigSpec, resourcePool, nil)
-	if err != nil {
-		return nil, err
-	}
+	return resourcePool, nil
+}
 
-	dummyVMTaskInfo, err := task.WaitForResult(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
+// Creates SCSIControllerLimit (maximum supported by a VM) SCSI controller configurations to add to a VM
+func createMaxSCSIControllersForDummyVM() []types.BaseVirtualDeviceConfigSpec {
+	var scsiConfigSpec []types.BaseVirtualDeviceConfigSpec
+	var i int32
+	for i = 0; i < SCSIControllerLimit; i++ {
+		virtualDeviceConfigSpec := &types.VirtualDeviceConfigSpec{
+			Operation: types.VirtualDeviceConfigSpecOperationAdd,
+		}
 
-	dummyVM := dummyVMTaskInfo.Result.(*object.VirtualMachine)
-	return dummyVM, nil
+		// Create virtual device key that can used by virtual disk.
+		var virtualDevice types.VirtualDevice
+		virtualDevice.Key = 1000 + i
+
+		// Create a virtual controller configuration.
+		var virtualController types.VirtualController
+		virtualController.BusNumber = i
+		virtualController.VirtualDevice = virtualDevice
+
+		// Create a pvscsi controller configuration.
+		var virtualSCSIController types.VirtualSCSIController
+		virtualSCSIController.SharedBus = types.VirtualSCSISharingNoSharing
+		virtualSCSIController.VirtualController = virtualController
+		pvscsiController := &types.ParaVirtualSCSIController{
+			virtualSCSIController,
+		}
+
+		// Add the pvscsi controller to virtualdeviceconfig spec.
+		virtualDeviceConfigSpec.Device = pvscsiController
+		scsiConfigSpec = append(scsiConfigSpec, virtualDeviceConfigSpec)
+	}
+	return scsiConfigSpec
 }
 
 // Creates a virtual disk with the policy configured to the disk.
@@ -1427,33 +1475,7 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 	// find SCSI controller of particular type from VM devices
 	scsiControllersOfRequiredType := getSCSIControllersOfType(vmDevices, diskControllerType)
 	scsiController := getAvailableSCSIController(scsiControllersOfRequiredType)
-	if scsiController == nil {
-		_, err = createAndAttachSCSIControllerToVM(ctx, virtualMachine, diskControllerType)
-		if err != nil {
-			glog.Errorf("Failed to create SCSI controller for VM :%q with err: %+v", virtualMachine.Name(), err)
-			return "", err
-		}
-
-		// verify scsi controller in virtual machine
-		vmDevices, err := virtualMachine.Device(ctx)
-		if err != nil {
-			return "", err
-		}
-
-		// Get VM device list
-		_, vmDevices, _, err = getVirtualMachineDevices(vs.cfg, ctx, vs.client, virtualMachine.Name())
-		if err != nil {
-			glog.Errorf("cannot get vmDevices for VM err=%s", err)
-			return "", fmt.Errorf("cannot get vmDevices for VM err=%s", err)
-		}
-
-		scsiControllersOfRequiredType := getSCSIControllersOfType(vmDevices, diskControllerType)
-		scsiController := getAvailableSCSIController(scsiControllersOfRequiredType)
-		if scsiController == nil {
-			glog.Errorf("cannot find SCSI controller in VM")
-			return "", fmt.Errorf("cannot find SCSI controller in VM")
-		}
-	}
+	glog.V(1).Infof("balu - took scsi controller : %+v", scsiController)
 
 	kubeVolsPath := filepath.Clean(datastore.Path(VolDir)) + "/"
 	// Create a kubevols directory in the datastore if one doesn't exist.
@@ -1473,8 +1495,18 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 	// 	return "", err
 	// }
 	// *disk.UnitNumber = unitNumber
-	rand.Seed(time.Now().UTC().UnixNano())
-	unitNum := int32(rand.Intn(16))
+	var unitNum int32
+	for {
+		rand.Seed(time.Now().UTC().UnixNano())
+		unitNum := int32(rand.Intn(16))
+		//unit number is reserved slot for scsi controller.
+		if unitNum == 7 {
+			continue
+		} else {
+			break
+		}
+	}
+
 	glog.V(1).Infof("balu - unitNum used is %d", unitNum)
 	*disk.UnitNumber = unitNum
 	disk.CapacityInKB = int64(volumeOptions.CapacityKB)
