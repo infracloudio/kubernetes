@@ -1374,6 +1374,7 @@ func (vs *VSphere) createDummyVM(ctx context.Context, datacenter *object.Datacen
 	}
 
 	scsiConfigSpec := createMaxSCSIControllersForDummyVM()
+	glog.V(1).Infof("balu - 4 scsi controller list for dummyVM: %+v", scsiConfigSpec)
 	virtualMachineConfigSpec.DeviceChange = scsiConfigSpec
 
 	// Get the resource pool for current node. This is where dummy VM will be created.
@@ -1496,9 +1497,9 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 	// }
 	// *disk.UnitNumber = unitNumber
 	var unitNum int32
+	rand.Seed(time.Now().UTC().UnixNano())
 	for {
-		rand.Seed(time.Now().UTC().UnixNano())
-		unitNum := int32(rand.Intn(16))
+		unitNum = int32(rand.Intn(16))
 		//unit number is reserved slot for scsi controller.
 		if unitNum == 7 {
 			continue
