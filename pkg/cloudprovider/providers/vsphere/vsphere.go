@@ -97,6 +97,7 @@ var ErrNonSupportedControllerType = errors.New("Disk is attached to non-supporte
 var ErrFileAlreadyExist = errors.New("File requested already exist")
 
 var clientLock sync.Mutex
+var vmCreateLock sync.Mutex
 
 // VSphere is an implementation of cloud provider Interface for VSphere.
 type VSphere struct {
@@ -1253,6 +1254,7 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 		// Check if the DummyVM exists in kubernetes cluster folder.
 		// The kubernetes cluster folder - vs.cfg.Global.WorkingDir is where all the nodes in the kubernetes cluster are created.
 		vmRegex := vs.cfg.Global.WorkingDir + DummyVMName
+		vmCreateLock.Lock()
 		dummyVM, err := f.VirtualMachine(ctx, vmRegex)
 		if err != nil {
 			// 1. Create dummy VM and return the VM reference.
@@ -1261,6 +1263,7 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 				return "", err
 			}
 		}
+		vmCreateLock.Unlock()
 
 		// 2. Reconfigure the VM to attach the disk with the VSAN policy configured.
 		vmDiskPath, err := vs.createVirtualDiskWithPolicy(ctx, dc, ds, dummyVM, volumeOptions)
