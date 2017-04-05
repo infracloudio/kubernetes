@@ -94,7 +94,7 @@ var diskFormatValidType = map[string]string{
 var DiskformatValidOptions = generateDiskFormatValidOptions()
 
 var ErrNoDiskUUIDFound = errors.New(NoDiskUUIDFoundErrMsg)
-var ErrNoDiskIDFound = errors.New(DiskNotFoundErrorMessage)
+var ErrNoDiskIDFound = errors.New(DiskNotFoundErrMsg)
 var ErrNoDevicesFound = errors.New(NoDevicesFoundErrMsg)
 var ErrNonSupportedControllerType = errors.New(NonSupportedControllerTypeErrMsg)
 var ErrFileAlreadyExist = errors.New(FileAlreadyExistErrMsg)
@@ -1295,13 +1295,13 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 		}
 
 		// 4. Delete the dummy VM
-		destroyTask, err = dummyVM.Destroy(ctx)
+		destroyTask, err := dummyVM.Destroy(ctx)
 		if err != nil {
-			return "", fmt.Errorf("Failed to destroy the vm: %q with err: %+v", vmName, err)
+			return "", fmt.Errorf("Failed to destroy the vm: %q with err: %+v", dummyVMFullName, err)
 		}
 		err = destroyTask.Wait(ctx)
 		if err != nil {
-			return "", fmt.Errorf("Failed to destroy the vm: %q with err: %+v", vmName, err)
+			return "", fmt.Errorf("Failed to destroy the vm: %q with err: %+v", dummyVMFullName, err)
 		}
 		destVolPath = vmDiskPath
 	} else {
