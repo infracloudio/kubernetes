@@ -1295,11 +1295,7 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 		}
 
 		// 4. Delete the dummy VM
-		destroyTask, err := dummyVM.Destroy(ctx)
-		if err != nil {
-			return "", fmt.Errorf("Failed to destroy the vm: %q with err: %+v", dummyVMFullName, err)
-		}
-		err = destroyTask.Wait(ctx)
+		err = deleteVM(ctx, dummyVM)
 		if err != nil {
 			return "", fmt.Errorf("Failed to destroy the vm: %q with err: %+v", dummyVMFullName, err)
 		}
@@ -1318,6 +1314,7 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 // DeleteVolume deletes a volume given volume name.
 // Also, deletes the folder where the volume resides.
 func (vs *VSphere) DeleteVolume(vmDiskPath string) error {
+	glog.V(1).Infof("balu - vmDiskPath in vsphere Delete volume is %s", vmDiskPath)
 	// Create context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1342,6 +1339,22 @@ func (vs *VSphere) DeleteVolume(vmDiskPath string) error {
 	if filepath.Ext(vmDiskPath) != ".vmdk" {
 		vmDiskPath += ".vmdk"
 	}
+
+	// Get the vmDisk Name
+	diskNameWithExt := path.Base(vmDiskPath)
+	diskName := strings.TrimSuffix(diskNameWithExt, filepath.Ext(diskNameWithExt))
+
+	// Search for the dummyVM if present and delete it.
+	dummyVMFullName := DummyVMPrefixName + "-" + diskName
+	vmRegex := vs.cfg.Global.WorkingDir + dummyVMFullName
+	dummyVM, err := f.VirtualMachine(ctx, vmRegex)
+	if err == nil {
+		err = deleteVM(ctx, dummyVM)
+		if err != nil {
+			return fmt.Errorf("Failed to destroy the vm: %q with err: %+v", dummyVMFullName, err)
+		}
+	}
+
 	// Delete virtual disk
 	task, err := virtualDiskManager.DeleteVirtualDisk(ctx, vmDiskPath, dc)
 	if err != nil {
@@ -1713,4 +1726,13 @@ func getFolder(ctx context.Context, c *govmomi.Client, datacenterName string, fo
 	}
 
 	return resultFolder, nil
+}
+
+// Delete the VM.
+func deleteVM(ctx context.Context, vm *object.VirtualMachine) error {
+	destroyTask, err := vm.Destroy(ctx)
+	if err != nil {
+		return err
+	}
+	return destroyTask.Wait(ctx)
 }
