@@ -1256,7 +1256,7 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 		}
 
 		cleanUpDummyVMLock.Lock()
-		if cleanUpRoutineInitialized {
+		if !cleanUpRoutineInitialized {
 			go vs.cleanUpDummyVMs(DummyVMPrefixName)
 			cleanUpRoutineInitialized = true
 		}
@@ -1414,6 +1414,7 @@ func (vs *VSphere) NodeExists(c *govmomi.Client, nodeName k8stypes.NodeName) (bo
 }
 
 func (vs *VSphere) cleanUpDummyVMs(dummyVMPrefix string) {
+	glog.V(1).Infof("balu - entering cleanUpDummyVMs function.")
 	// Create context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1431,6 +1432,7 @@ func (vs *VSphere) cleanUpDummyVMs(dummyVMPrefix string) {
 
 		// Get the folder reference for global working directory where the dummy VM needs to be created.
 		vmFolder, err := getFolder(ctx, vs.client, vs.cfg.Global.Datacenter, vs.cfg.Global.WorkingDir)
+		glog.V(1).Infof("balu - cleanUpDummyVMs vmFolder is %+v.", vmFolder)
 		if err == nil {
 			dummyVMRefList := getDummyVMList(ctx, vs.client, vmFolder, dummyVMPrefix)
 			for _, dummyVMRef := range dummyVMRefList {
@@ -1443,6 +1445,7 @@ func (vs *VSphere) cleanUpDummyVMs(dummyVMPrefix string) {
 }
 
 func getDummyVMList(ctx context.Context, c *govmomi.Client, vmFolder *object.Folder, dummyVMPrefix string) []*object.VirtualMachine {
+	glog.V(1).Infof("balu - Entered getDummyVMList function")
 	vmFolders, _ := vmFolder.Children(ctx)
 	var vmFolderRefs []types.ManagedObjectReference
 	for _, vmFolder := range vmFolders {
@@ -1452,6 +1455,7 @@ func getDummyVMList(ctx context.Context, c *govmomi.Client, vmFolder *object.Fol
 	var vmRefs []types.ManagedObjectReference
 	for _, vmFolder := range vmFolderRefs {
 		if vmFolder.Type == "VirtualMachine" {
+			glog.V(1).Infof("balu - Entered getDummyVMList function. Found VM.")
 			vmRefs = append(vmRefs, vmFolder)
 		}
 	}
