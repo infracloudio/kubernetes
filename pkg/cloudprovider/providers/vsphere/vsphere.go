@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/gcfg.v1"
 
@@ -66,7 +67,7 @@ const (
 	ZeroedThickDiskType              = "zeroedThick"
 	VolDir                           = "kubevols"
 	RoundTripperDefaultCount         = 3
-	DummyVMPrefixName                = "kubernetes"
+	DummyVMPrefixName                = "vsphere-k8s"
 	VSANDatastoreType                = "vsan"
 	DiskNotFoundErrMsg               = "No vSphere disk ID found"
 	NoDiskUUIDFoundErrMsg            = "No disk UUID found"
@@ -92,6 +93,7 @@ var diskFormatValidType = map[string]string{
 }
 
 var DiskformatValidOptions = generateDiskFormatValidOptions()
+var cleanUpRoutineInitialized = false
 
 var ErrNoDiskUUIDFound = errors.New(NoDiskUUIDFoundErrMsg)
 var ErrNoDiskIDFound = errors.New(DiskNotFoundErrMsg)
@@ -100,6 +102,7 @@ var ErrNonSupportedControllerType = errors.New(NonSupportedControllerTypeErrMsg)
 var ErrFileAlreadyExist = errors.New(FileAlreadyExistErrMsg)
 
 var clientLock sync.Mutex
+var cleanUpDummyVMLock sync.Mutex
 
 // VSphere is an implementation of cloud provider Interface for VSphere.
 type VSphere struct {
@@ -1252,6 +1255,13 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 				" So, please specify a valid VSAN datastore in Storage class definition.", datastore)
 		}
 
+		cleanUpDummyVMLock.Lock()
+		if cleanUpRoutineInitialized {
+			go vs.cleanUpDummyVMs(DummyVMPrefixName)
+			cleanUpRoutineInitialized = true
+		}
+		cleanUpDummyVMLock.Unlock()
+
 		// Check if the VM exists in kubernetes cluster folder.
 		// The kubernetes cluster folder - vs.cfg.Global.WorkingDir is where all the nodes in the kubernetes cluster are created.
 		dummyVMFullName := DummyVMPrefixName + "-" + volumeOptions.Name
@@ -1401,6 +1411,68 @@ func (vs *VSphere) NodeExists(c *govmomi.Client, nodeName k8stypes.NodeName) (bo
 	}
 
 	return false, nil
+}
+
+func (vs *VSphere) cleanUpDummyVMs(dummyVMPrefix string) {
+	// Create context
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for {
+		// Ensure client is logged in and session is valid
+		vSphereLogin(vs, ctx)
+
+		// Create a new finder
+		f := find.NewFinder(vs.client.Client, true)
+
+		// Fetch and set data center
+		dc, err := f.Datacenter(ctx, vs.cfg.Global.Datacenter)
+		f.SetDatacenter(dc)
+
+		// Get the folder reference for global working directory where the dummy VM needs to be created.
+		vmFolder, err := getFolder(ctx, vs.client, vs.cfg.Global.Datacenter, vs.cfg.Global.WorkingDir)
+		if err == nil {
+			dummyVMRefList := getDummyVMList(ctx, vs.client, vmFolder, dummyVMPrefix)
+			for _, dummyVMRef := range dummyVMRefList {
+				glog.V(1).Infof("balu - cleanUpDummyVMs found.")
+				deleteVM(ctx, dummyVMRef)
+			}
+		}
+		time.Sleep(5 * time.Minute)
+	}
+}
+
+func getDummyVMList(ctx context.Context, c *govmomi.Client, vmFolder *object.Folder, dummyVMPrefix string) []*object.VirtualMachine {
+	vmFolders, _ := vmFolder.Children(ctx)
+	var vmFolderRefs []types.ManagedObjectReference
+	for _, vmFolder := range vmFolders {
+		vmFolderRefs = append(vmFolderRefs, vmFolder.Reference())
+	}
+
+	var vmRefs []types.ManagedObjectReference
+	for _, vmFolder := range vmFolderRefs {
+		if vmFolder.Type == "VirtualMachine" {
+			vmRefs = append(vmRefs, vmFolder)
+		}
+	}
+
+	var dummyVMRefList []*object.VirtualMachine
+	pc := property.DefaultCollector(c.Client)
+	for _, vmRef := range vmRefs {
+		var refs []types.ManagedObjectReference
+		var vmMorefs []mo.VirtualMachine
+		refs = append(refs, vmRef)
+		pc.Retrieve(ctx, refs, []string{"name"}, &vmMorefs)
+		for _, vmMoref := range vmMorefs {
+			glog.V(1).Infof("balu - vm name in getDummyVMList is %q", vmMoref.Name)
+			if strings.HasPrefix(vmMoref.Name, dummyVMPrefix) {
+				glog.V(1).Infof("balu - dummy vm name in getDummyVMList is %q", vmMoref.Name)
+				dummyVMRefList = append(dummyVMRefList, object.NewVirtualMachine(c.Client, vmRef))
+			}
+		}
+	}
+
+	return dummyVMRefList
 }
 
 func (vs *VSphere) createDummyVM(ctx context.Context, datacenter *object.Datacenter, datastore *object.Datastore, vmName string) (*object.VirtualMachine, error) {
