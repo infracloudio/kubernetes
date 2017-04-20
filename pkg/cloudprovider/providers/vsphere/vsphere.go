@@ -102,7 +102,8 @@ var ErrNonSupportedControllerType = errors.New(NonSupportedControllerTypeErrMsg)
 var ErrFileAlreadyExist = errors.New(FileAlreadyExistErrMsg)
 
 var clientLock sync.Mutex
-var cleanUpDummyVMLock sync.Mutex
+var cleanUpRoutineInitLock sync.Mutex
+var cleanUpDummyVMLock sync.RWMutex
 
 // VSphere is an implementation of cloud provider Interface for VSphere.
 type VSphere struct {
@@ -1255,12 +1256,14 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 				" So, please specify a valid VSAN datastore in Storage class definition.", datastore)
 		}
 
-		cleanUpDummyVMLock.Lock()
+		cleanUpDummyVMLock.RLock()
+		glog.V(1).Infof("balu - In createVolume cleanUpDummyVMLock read lock acquired")
+		cleanUpRoutineInitLock.Lock()
 		if !cleanUpRoutineInitialized {
 			go vs.cleanUpDummyVMs(DummyVMPrefixName)
 			cleanUpRoutineInitialized = true
 		}
-		cleanUpDummyVMLock.Unlock()
+		cleanUpRoutineInitLock.Unlock()
 
 		// Check if the VM exists in kubernetes cluster folder.
 		// The kubernetes cluster folder - vs.cfg.Global.WorkingDir is where all the nodes in the kubernetes cluster are created.
@@ -1271,6 +1274,8 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 			// 1. Create a dummy VM and return the VM reference.
 			dummyVM, err = vs.createDummyVM(ctx, dc, ds, dummyVMFullName)
 			if err != nil {
+				cleanUpDummyVMLock.RUnlock()
+				glog.V(1).Infof("balu - In createVolume cleanUpDummyVMLock read lock released")
 				return "", err
 			}
 		}
@@ -1287,6 +1292,8 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 				glog.V(1).Infof("File: %v is already exists", vmDiskPath)
 			} else {
 				glog.Errorf("Failed to attach the disk to VM: %q with err: %+v", dummyVMFullName, err)
+				cleanUpDummyVMLock.RUnlock()
+				glog.V(1).Infof("balu - In createVolume cleanUpDummyVMLock read lock released")
 				return "", err
 			}
 		}
@@ -1300,6 +1307,8 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 				glog.V(1).Infof("File: %v is already detached", vmDiskPath)
 			} else {
 				glog.Errorf("Failed to detach the disk: %q from VM: %q with err: %+v", vmDiskPath, dummyVMFullName, err)
+				cleanUpDummyVMLock.RUnlock()
+				glog.V(1).Infof("balu - In createVolume cleanUpDummyVMLock read lock released")
 				return "", fmt.Errorf("Failed to create the volume: %q with err: %+v", volumeOptions.Name, err)
 			}
 		}
@@ -1307,9 +1316,13 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 		// 4. Delete the dummy VM
 		err = deleteVM(ctx, dummyVM)
 		if err != nil {
+			cleanUpDummyVMLock.RUnlock()
+			glog.V(1).Infof("balu - In createVolume cleanUpDummyVMLock read lock released")
 			return "", fmt.Errorf("Failed to destroy the vm: %q with err: %+v", dummyVMFullName, err)
 		}
 		destVolPath = vmDiskPath
+		cleanUpDummyVMLock.RUnlock()
+		glog.V(1).Infof("balu - In createVolume cleanUpDummyVMLock read lock released")
 	} else {
 		// Create a virtual disk directly if no VSAN storage capabilities are specified by the user.
 		destVolPath, err = createVirtualDisk(ctx, vs.client, dc, ds, volumeOptions)
@@ -1420,63 +1433,80 @@ func (vs *VSphere) cleanUpDummyVMs(dummyVMPrefix string) {
 	defer cancel()
 
 	for {
+		time.Sleep(5 * time.Minute)
 		// Ensure client is logged in and session is valid
-		vSphereLogin(vs, ctx)
+		err := vSphereLogin(vs, ctx)
+		if err != nil {
+			glog.V(4).Infof("[cleanUpDummyVMs] Unable to login to vSphere with err: %+v", err)
+			continue
+		}
 
 		// Create a new finder
 		f := find.NewFinder(vs.client.Client, true)
 
 		// Fetch and set data center
 		dc, err := f.Datacenter(ctx, vs.cfg.Global.Datacenter)
+		if err != nil {
+			glog.V(4).Infof("[cleanUpDummyVMs] Unable to fetch the datacenter: %q with err: %+v", vs.cfg.Global.Datacenter, err)
+			continue
+		}
 		f.SetDatacenter(dc)
 
 		// Get the folder reference for global working directory where the dummy VM needs to be created.
 		vmFolder, err := getFolder(ctx, vs.client, vs.cfg.Global.Datacenter, vs.cfg.Global.WorkingDir)
+		if err != nil {
+			glog.V(4).Infof("[cleanUpDummyVMs] Unable to get the kubernetes folder: %q reference with err: %+v", vs.cfg.Global.WorkingDir, err)
+			continue
+		}
 		glog.V(1).Infof("balu - cleanUpDummyVMs vmFolder is %+v.", vmFolder)
-		if err == nil {
-			dummyVMRefList := getDummyVMList(ctx, vs.client, vmFolder, dummyVMPrefix)
-			for _, dummyVMRef := range dummyVMRefList {
-				glog.V(1).Infof("balu - cleanUpDummyVMs found.")
-				deleteVM(ctx, dummyVMRef)
+		cleanUpDummyVMLock.Lock()
+		glog.V(1).Infof("balu - In cleanUpDummyVMs cleanUpDummyVMLock write lock acquired")
+		dummyVMRefList, err := getDummyVMList(ctx, vs.client, vmFolder, dummyVMPrefix)
+		if err != nil {
+			glog.V(4).Infof("[cleanUpDummyVMs] Unable to get dummy VM list in the kubernetes cluster: %q reference with err: %+v", vs.cfg.Global.WorkingDir, err)
+			cleanUpDummyVMLock.Unlock()
+			continue
+		}
+		for _, dummyVMRef := range dummyVMRefList {
+			glog.V(1).Infof("balu - cleanUpDummyVMs found.")
+			err = deleteVM(ctx, dummyVMRef)
+			if err != nil {
+				glog.V(4).Infof("[cleanUpDummyVMs] Unable to delete dummy VM: %q with err: %+v", dummyVMRef.Name(), err)
+				continue
 			}
 		}
-		time.Sleep(5 * time.Minute)
+		cleanUpDummyVMLock.Unlock()
+		glog.V(1).Infof("balu - In cleanUpDummyVMs cleanUpDummyVMLock write lock released")
 	}
 }
 
-func getDummyVMList(ctx context.Context, c *govmomi.Client, vmFolder *object.Folder, dummyVMPrefix string) []*object.VirtualMachine {
+func getDummyVMList(ctx context.Context, c *govmomi.Client, vmFolder *object.Folder, dummyVMPrefix string) ([]*object.VirtualMachine, error) {
 	glog.V(1).Infof("balu - Entered getDummyVMList function")
-	vmFolders, _ := vmFolder.Children(ctx)
-	var vmFolderRefs []types.ManagedObjectReference
-	for _, vmFolder := range vmFolders {
-		vmFolderRefs = append(vmFolderRefs, vmFolder.Reference())
-	}
-
-	var vmRefs []types.ManagedObjectReference
-	for _, vmFolder := range vmFolderRefs {
-		if vmFolder.Type == "VirtualMachine" {
-			glog.V(1).Infof("balu - Entered getDummyVMList function. Found VM.")
-			vmRefs = append(vmRefs, vmFolder)
-		}
+	vmFolders, err := vmFolder.Children(ctx)
+	if err != nil {
+		glog.V(4).Infof("Unable to retrieve the virtual machines from the kubernetes cluster: %+v", vmFolder)
+		return nil, err
 	}
 
 	var dummyVMRefList []*object.VirtualMachine
 	pc := property.DefaultCollector(c.Client)
-	for _, vmRef := range vmRefs {
-		var refs []types.ManagedObjectReference
-		var vmMorefs []mo.VirtualMachine
-		refs = append(refs, vmRef)
-		pc.Retrieve(ctx, refs, []string{"name"}, &vmMorefs)
-		for _, vmMoref := range vmMorefs {
-			glog.V(1).Infof("balu - vm name in getDummyVMList is %q", vmMoref.Name)
-			if strings.HasPrefix(vmMoref.Name, dummyVMPrefix) {
-				glog.V(1).Infof("balu - dummy vm name in getDummyVMList is %q", vmMoref.Name)
-				dummyVMRefList = append(dummyVMRefList, object.NewVirtualMachine(c.Client, vmRef))
+	for _, vmFolder := range vmFolders {
+		if vmFolder.Reference().Type == "VirtualMachine" {
+			var vmRefs []types.ManagedObjectReference
+			var vmMorefs []mo.VirtualMachine
+			vmRefs = append(vmRefs, vmFolder.Reference())
+			err = pc.Retrieve(ctx, vmRefs, []string{"name"}, &vmMorefs)
+			if err != nil {
+				return nil, err
+			}
+			glog.V(1).Infof("balu - vm name in getDummyVMList is %s", vmMorefs[0].Name)
+			if strings.HasPrefix(vmMorefs[0].Name, dummyVMPrefix) {
+				glog.V(1).Infof("balu - dummy vm name in getDummyVMList is %s", vmMorefs[0].Name)
+				dummyVMRefList = append(dummyVMRefList, object.NewVirtualMachine(c.Client, vmRefs[0]))
 			}
 		}
 	}
-
-	return dummyVMRefList
+	return dummyVMRefList, nil
 }
 
 func (vs *VSphere) createDummyVM(ctx context.Context, datacenter *object.Datacenter, datastore *object.Datastore, vmName string) (*object.VirtualMachine, error) {
@@ -1528,7 +1558,8 @@ func (vs *VSphere) createDummyVM(ctx context.Context, datacenter *object.Datacen
 		return nil, err
 	}
 
-	dummyVM := dummyVMTaskInfo.Result.(*object.VirtualMachine)
+	vmRef := dummyVMTaskInfo.Result.(object.Reference)
+	dummyVM := object.NewVirtualMachine(vs.client.Client, vmRef.Reference())
 	return dummyVM, nil
 }
 
