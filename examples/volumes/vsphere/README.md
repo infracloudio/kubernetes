@@ -84,15 +84,19 @@
       kind: PersistentVolume
       metadata:
         name: pv0001
+        annotations:
+	  volume.kubernetes.io/node: node1
       spec:
         capacity:
-          storage: 2Gi
+          storage: 10Gi
         accessModes:
           - ReadWriteOnce
         persistentVolumeReclaimPolicy: Retain
         vsphereVolume:
-          volumePath: "[datastore1] volumes/myDisk"
+          volumePath: "[vmfs1] volumes/myDisk"
           fsType: ext4
+        persistentVolumeReclaimPolicy: Delete
+        storageClassName: local-fast-1
       ```
 
       [Download example](vsphere-volume-pv.yaml?raw=true)
@@ -131,6 +135,8 @@
       apiVersion: v1
       metadata:
         name: pvc0001
+        annotations:
+          volume.beta.kubernetes.io/storage-class: local-fast-1
       spec:
         accessModes:
           - ReadWriteOnce
