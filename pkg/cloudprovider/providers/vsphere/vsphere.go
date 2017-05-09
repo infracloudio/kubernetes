@@ -45,6 +45,7 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 	"golang.org/x/net/context"
 
+	pbm "github.com/vmware/govmomi/pbm"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	k8runtime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/api/v1"
@@ -163,7 +164,7 @@ type VSphereConfig struct {
 type Volumes interface {
 	// AttachDisk attaches given disk to given node. Current node
 	// is used when nodeName is empty string.
-	AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (diskID string, diskUUID string, err error)
+	AttachDisk(vmDiskPath string, storagePolicyID string, nodeName k8stypes.NodeName) (diskID string, diskUUID string, err error)
 
 	// DetachDisk detaches given disk to given node. Current node
 	// is used when nodeName is empty string.
@@ -187,12 +188,14 @@ type Volumes interface {
 
 // VolumeOptions specifies capacity, tags, name and diskFormat for a volume.
 type VolumeOptions struct {
-	CapacityKB         int
-	Tags               map[string]string
-	Name               string
-	DiskFormat         string
-	Datastore          string
-	StorageProfileData string
+	CapacityKB             int
+	Tags                   map[string]string
+	Name                   string
+	DiskFormat             string
+	Datastore              string
+	VSANStorageProfileData string
+	StoragePolicyName      string
+	StoragePolicyID        string
 }
 
 // Generates Valid Options for Diskformat
@@ -530,12 +533,14 @@ func (vs *VSphere) NodeAddresses(nodeName k8stypes.NodeName) ([]v1.NodeAddress, 
 			addressType = v1.NodeInternalIP
 		}
 		for _, ip := range v.IpAddress {
-			v1helper.AddToNodeAddresses(&addrs,
-				v1.NodeAddress{
-					Type:    addressType,
-					Address: ip,
-				},
-			)
+			if net.ParseIP(ip).To4() != nil {
+				v1helper.AddToNodeAddresses(&addrs,
+					v1.NodeAddress{
+						Type:    addressType,
+						Address: ip,
+					},
+				)
+			}
 		}
 	}
 	return addrs, nil
@@ -711,7 +716,7 @@ func cleanUpController(ctx context.Context, newSCSIController types.BaseVirtualD
 }
 
 // Attaches given virtual disk volume to the compute running kubelet.
-func (vs *VSphere) AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (diskID string, diskUUID string, err error) {
+func (vs *VSphere) AttachDisk(vmDiskPath string, storagePolicyID string, nodeName k8stypes.NodeName) (diskID string, diskUUID string, err error) {
 	var newSCSIController types.BaseVirtualDevice
 
 	// Create context
@@ -759,14 +764,8 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (di
 			return "", "", err
 		}
 
-		// verify scsi controller in virtual machine
-		vmDevices, err := vm.Device(ctx)
-		if err != nil {
-			return "", "", err
-		}
-
 		// Get VM device list
-		_, vmDevices, _, err = getVirtualMachineDevices(ctx, vs.cfg, vs.client, vSphereInstance)
+		_, vmDevices, _, err := getVirtualMachineDevices(ctx, vs.cfg, vs.client, vSphereInstance)
 		if err != nil {
 			glog.Errorf("cannot get vmDevices for VM err=%s", err)
 			return "", "", fmt.Errorf("cannot get vmDevices for VM err=%s", err)
@@ -785,9 +784,9 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (di
 
 	// Create a new finder
 	f := find.NewFinder(vs.client.Client, true)
-
 	// Set data center
 	f.SetDatacenter(dc)
+
 	datastorePathObj := new(object.DatastorePath)
 	isSuccess := datastorePathObj.FromString(vmDiskPath)
 	if !isSuccess {
@@ -811,8 +810,22 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (di
 	backing := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
 	backing.DiskMode = string(types.VirtualDiskModeIndependent_persistent)
 
+	// Reconfigure VM
+	virtualMachineConfigSpec := types.VirtualMachineConfigSpec{
+		DeviceChange: []types.BaseVirtualDeviceConfigSpec{
+			&types.VirtualDeviceConfigSpec{
+				Device:    disk,
+				Operation: types.VirtualDeviceConfigSpecOperationAdd,
+				Profile: []types.BaseVirtualMachineProfileSpec{
+					&types.VirtualMachineDefinedProfileSpec{
+						ProfileId: storagePolicyID,
+					},
+				},
+			},
+		},
+	}
 	// Attach disk to the VM
-	err = vm.AddDevice(ctx, disk)
+	task, err := vm.Reconfigure(ctx, virtualMachineConfigSpec)
 	if err != nil {
 		glog.Errorf("cannot attach disk to the vm - %v", err)
 		if newSCSICreated {
@@ -820,19 +833,30 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (di
 		}
 		return "", "", err
 	}
+	err = task.Wait(ctx)
+	if err != nil {
+		glog.Errorf("Failed to reconfigure the VM with the disk with err - %v.", err)
+		return "", "", err
+	}
 
-	vmDevices, err = vm.Device(ctx)
+	deviceName, diskUUID, err := getVMDiskInfo(ctx, vm, disk)
 	if err != nil {
 		if newSCSICreated {
 			cleanUpController(ctx, newSCSIController, vmDevices, vm)
 		}
+		vs.DetachDisk(deviceName, nodeName)
+		return "", "", err
+	}
+	return deviceName, diskUUID, nil
+}
+
+func getVMDiskInfo(ctx context.Context, vm *object.VirtualMachine, disk *types.VirtualDisk) (string, string, error) {
+	vmDevices, err := vm.Device(ctx)
+	if err != nil {
 		return "", "", err
 	}
 	devices := vmDevices.SelectByType(disk)
 	if len(devices) < 1 {
-		if newSCSICreated {
-			cleanUpController(ctx, newSCSIController, vmDevices, vm)
-		}
 		return "", "", ErrNoDevicesFound
 	}
 
@@ -841,18 +865,13 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, nodeName k8stypes.NodeName) (di
 	deviceName := devices.Name(newDevice)
 
 	// get device uuid
-	diskUUID, err = getVirtualDiskUUID(newDevice)
+	diskUUID, err := getVirtualDiskUUID(newDevice)
 	if err != nil {
-		if newSCSICreated {
-			cleanUpController(ctx, newSCSIController, vmDevices, vm)
-		}
-		vs.DetachDisk(deviceName, nodeName)
 		return "", "", err
 	}
 
 	return deviceName, diskUUID, nil
 }
-
 func getNextUnitNumber(devices object.VirtualDeviceList, c types.BaseVirtualController) (int32, error) {
 	// get next available SCSI controller unit number
 	var takenUnitNumbers [SCSIDeviceSlots]bool
@@ -1204,6 +1223,7 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 
 	var datastore string
 	var destVolPath string
+	var pbmClient *pbm.Client
 
 	// Default datastore is the datastore in the vSphere config file that is used initialize vSphere cloud provider.
 	if volumeOptions.Datastore == "" {
@@ -1246,13 +1266,16 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 		return "", err
 	}
 
-	// Create a disk with the VSAN storage capabilities specified in the volumeOptions.StorageProfileData.
-	// This is achieved by following steps:
-	// 1. Create dummy VM if not already present.
-	// 2. Add a new disk to the VM by performing VM reconfigure.
-	// 3. Detach the new disk from the dummy VM.
-	// 4. Delete the dummy VM.
-	if volumeOptions.StorageProfileData != "" {
+	if volumeOptions.StoragePolicyName != "" {
+		// Get the pbm client
+		pbmClient, err = pbm.NewClient(ctx, vs.client.Client)
+		volumeOptions.StoragePolicyID, err = pbmClient.ProfileIDByName(ctx, volumeOptions.StoragePolicyName)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	if volumeOptions.VSANStorageProfileData != "" {
 		// Check if the datastore is VSAN if any capability requirements are specified.
 		// VSphere cloud provider now only supports VSAN capabilities requirements
 		ok, err := checkIfDatastoreTypeIsVSAN(vs.client, ds)
@@ -1265,7 +1288,14 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 				" The policy parameters will work only with VSAN Datastore."+
 				" So, please specify a valid VSAN datastore in Storage class definition.", datastore)
 		}
-
+	}
+	// Create a disk with the VSAN storage capabilities specified in the volumeOptions.VSANStorageProfileData.
+	// This is achieved by following steps:
+	// 1. Create dummy VM if not already present.
+	// 2. Add a new disk to the VM by performing VM reconfigure.
+	// 3. Detach the new disk from the dummy VM.
+	// 4. Delete the dummy VM.
+	if volumeOptions.VSANStorageProfileData != "" || volumeOptions.StoragePolicyName != "" {
 		// Acquire a read lock to ensure multiple PVC requests can be processed simultaneously.
 		cleanUpDummyVMLock.RLock()
 		defer cleanUpDummyVMLock.RUnlock()
@@ -1639,12 +1669,17 @@ func (vs *VSphere) createVirtualDiskWithPolicy(ctx context.Context, datacenter *
 		FileOperation: types.VirtualDeviceConfigSpecFileOperationCreate,
 	}
 
-	storageProfileSpec := &types.VirtualMachineDefinedProfileSpec{
-		ProfileId: "",
-		ProfileData: &types.VirtualMachineProfileRawData{
+	storageProfileSpec := &types.VirtualMachineDefinedProfileSpec{}
+	// Is PBM storage policy ID is present, set the storage spec profile ID,
+	// else, set raw the VSAN policy string.
+	if volumeOptions.StoragePolicyID != "" {
+		storageProfileSpec.ProfileId = volumeOptions.StoragePolicyID
+	} else if volumeOptions.VSANStorageProfileData != "" {
+		storageProfileSpec.ProfileId = ""
+		storageProfileSpec.ProfileData = &types.VirtualMachineProfileRawData{
 			ExtensionKey: "com.vmware.vim.sps",
-			ObjectData:   volumeOptions.StorageProfileData,
-		},
+			ObjectData:   volumeOptions.VSANStorageProfileData,
+		}
 	}
 
 	deviceConfigSpec.Profile = append(deviceConfigSpec.Profile, storageProfileSpec)
