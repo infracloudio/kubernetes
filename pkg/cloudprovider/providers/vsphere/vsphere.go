@@ -810,24 +810,22 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, storagePolicyID string, nodeNam
 	backing := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
 	backing.DiskMode = string(types.VirtualDiskModeIndependent_persistent)
 
-	// Reconfigure VM
-	virtualMachineConfigSpec := types.VirtualMachineConfigSpec{
-		DeviceChange: []types.BaseVirtualDeviceConfigSpec{
-			&types.VirtualDeviceConfigSpec{
-				Device:    disk,
-				Operation: types.VirtualDeviceConfigSpecOperationAdd,
-				Profile: []types.BaseVirtualMachineProfileSpec{
-					&types.VirtualMachineDefinedProfileSpec{
-						ProfileId: storagePolicyID,
-					},
-				},
-			},
-		},
+	virtualMachineConfigSpec := types.VirtualMachineConfigSpec{}
+	deviceConfigSpec := &types.VirtualDeviceConfigSpec{
+		Device:    disk,
+		Operation: types.VirtualDeviceConfigSpecOperationAdd,
 	}
-	// Attach disk to the VM
+	// Configure the disk with the SPBM profile only if ProfileID is not empty.
+	if storagePolicyID != "" {
+		profileSpec := &types.VirtualMachineDefinedProfileSpec{
+			ProfileId: storagePolicyID,
+		}
+		deviceConfigSpec.Profile = append(deviceConfigSpec.Profile, profileSpec)
+	}
+	virtualMachineConfigSpec.DeviceChange = append(virtualMachineConfigSpec.DeviceChange, deviceConfigSpec)
 	task, err := vm.Reconfigure(ctx, virtualMachineConfigSpec)
 	if err != nil {
-		glog.Errorf("cannot attach disk to the vm - %v", err)
+		glog.Errorf("Failed to attach the disk with storagePolicy: %+q with err - %v", storagePolicyID, err)
 		if newSCSICreated {
 			cleanUpController(ctx, newSCSIController, vmDevices, vm)
 		}
@@ -835,7 +833,10 @@ func (vs *VSphere) AttachDisk(vmDiskPath string, storagePolicyID string, nodeNam
 	}
 	err = task.Wait(ctx)
 	if err != nil {
-		glog.Errorf("Failed to reconfigure the VM with the disk with err - %v.", err)
+		glog.Errorf("Failed to attach the disk with storagePolicy: %+q with err - %v", storagePolicyID, err)
+		if newSCSICreated {
+			cleanUpController(ctx, newSCSIController, vmDevices, vm)
+		}
 		return "", "", err
 	}
 
@@ -1223,7 +1224,6 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 
 	var datastore string
 	var destVolPath string
-	var pbmClient *pbm.Client
 
 	// Default datastore is the datastore in the vSphere config file that is used initialize vSphere cloud provider.
 	if volumeOptions.Datastore == "" {
@@ -1260,19 +1260,42 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 	dc, err := f.Datacenter(ctx, vs.cfg.Global.Datacenter)
 	f.SetDatacenter(dc)
 
-	ds, err := f.Datastore(ctx, datastore)
-	if err != nil {
-		glog.Errorf("Failed while searching for datastore %+q. err %s", datastore, err)
-		return "", err
-	}
-
 	if volumeOptions.StoragePolicyName != "" {
 		// Get the pbm client
-		pbmClient, err = pbm.NewClient(ctx, vs.client.Client)
+		pbmClient, err := pbm.NewClient(ctx, vs.client.Client)
+		if err != nil {
+			return "", err
+		}
 		volumeOptions.StoragePolicyID, err = pbmClient.ProfileIDByName(ctx, volumeOptions.StoragePolicyName)
 		if err != nil {
 			return "", err
 		}
+		// Get the resource pool for current node.
+		resourcePool, err := vs.getCurrentNodeResourcePool(ctx, dc)
+		if err != nil {
+			return "", err
+		}
+		glog.V(1).Infof("balu - CreateVolume policyName: %q and ID:%q", volumeOptions.StoragePolicyName, volumeOptions.StoragePolicyID)
+		dsRefs, err := vs.GetCompatibleDatastores(ctx, pbmClient, resourcePool, volumeOptions.StoragePolicyID)
+		if err != nil {
+			return "", err
+		}
+		glog.V(1).Infof("balu - CreateVolume compatible datastores is %+v", dsRefs)
+		if volumeOptions.Datastore != "" {
+			if !IsUserSpecifiedDatastoreCompatible(dsRefs, volumeOptions.Datastore) {
+				return "", fmt.Errorf("User specified datastore: %q is not compatible with the StoragePolicy: %q requirements", volumeOptions.Datastore, volumeOptions.StoragePolicyName)
+			}
+		} else {
+			datastore = GetBestFitCompatibleDatastore(dsRefs)
+			glog.V(1).Infof("balu - CreateVolume best fit datastore is %q", datastore)
+		}
+	}
+
+	glog.V(1).Infof("balu - CreateVolume final datastore is %q", datastore)
+	ds, err := f.Datastore(ctx, datastore)
+	if err != nil {
+		glog.Errorf("Failed while searching for datastore %+q. err %s", datastore, err)
+		return "", err
 	}
 
 	if volumeOptions.VSANStorageProfileData != "" {
@@ -1566,13 +1589,11 @@ func (vs *VSphere) createDummyVM(ctx context.Context, datacenter *object.Datacen
 	if err != nil {
 		return nil, err
 	}
-
 	// Get the folder reference for global working directory where the dummy VM needs to be created.
 	vmFolder, err := getFolder(ctx, vs.client, vs.cfg.Global.Datacenter, vs.cfg.Global.WorkingDir)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to get the folder reference for %q with err: %+v", vs.cfg.Global.WorkingDir, err)
 	}
-
 	task, err := vmFolder.CreateVM(ctx, virtualMachineConfigSpec, resourcePool, nil)
 	if err != nil {
 		return nil, err

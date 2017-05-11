@@ -130,7 +130,7 @@ func (util *VsphereDiskUtil) CreateVolume(v *vsphereVolumeProvisioner) (volSpec 
 
 	if volumeOptions.VSANStorageProfileData != "" {
 		if volumeOptions.StoragePolicyName != "" {
-			return nil, fmt.Errorf("Cannot specify storage policy capabilities along with storage policy name. Please specify only one")
+			return nil, fmt.Errorf("Cannot specify storage policy capabilities along with storage policy name. Please specify only one.")
 		}
 		volumeOptions.VSANStorageProfileData = "(" + volumeOptions.VSANStorageProfileData + ")"
 	}
