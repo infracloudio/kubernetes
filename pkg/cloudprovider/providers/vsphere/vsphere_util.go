@@ -22,7 +22,11 @@ import (
 	"runtime"
 	"strings"
 
+	"fmt"
+
+	"github.com/golang/glog"
 	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/pbm"
 	"github.com/vmware/govmomi/property"
@@ -35,6 +39,8 @@ import (
 const (
 	DatastoreProperty     = "datastore"
 	DatastoreInfoProperty = "info"
+	Folder                = "Folder"
+	VirtualMachine        = "VirtualMachine"
 )
 
 // Reads vSphere configuration from system environment and construct vSphere object
@@ -78,11 +84,13 @@ func GetgovmomiClient(cfg *VSphereConfig) (*govmomi.Client, error) {
 }
 
 // Get placement compatibility result based on storage policy requirements.
-func (vs *VSphere) GetPlacementCompatibilityResult(ctx context.Context, pbmClient *pbm.Client, vmObj *object.VirtualMachine, storagePolicyID string) (pbm.PlacementCompatibilityResult, error) {
-	datastores, err := vs.getAllAccessibleDatastores(ctx, vmObj)
+func (vs *VSphere) GetPlacementCompatibilityResult(ctx context.Context, pbmClient *pbm.Client, storagePolicyID string) (pbm.PlacementCompatibilityResult, error) {
+	datastores, err := vs.getSharedDatastoresInK8SCluster(ctx)
 	if err != nil {
+		glog.V(1).Infof("balu - [GetPlacementCompatibilityResult] after shared ds err: %+v", err)
 		return nil, err
 	}
+	glog.V(1).Infof("balu - [GetPlacementCompatibilityResult] shared datastores: %+v", datastores)
 	var hubs []pbmtypes.PbmPlacementHub
 	for _, ds := range datastores {
 		hubs = append(hubs, pbmtypes.PbmPlacementHub{
@@ -190,6 +198,125 @@ func (vs *VSphere) getDatastoreMo(ctx context.Context, hubs []pbmtypes.PbmPlacem
 }
 
 // Get all datastores accessible for the virtual machine object.
+func (vs *VSphere) getSharedDatastoresInK8SCluster(ctx context.Context) ([]types.ManagedObjectReference, error) {
+	vmFolder, err := vs.GetFolder(ctx, vs.cfg.Global.Datacenter, strings.TrimSuffix(vs.cfg.Global.WorkingDir, "/"))
+	if err != nil {
+		glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] err after GetFolder: %+v", err)
+		return nil, err
+	}
+	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] folder reference: %+v", vmFolder)
+	vmMoList, err := vs.GetVMsInsideFolder(ctx, vmFolder, []string{NameProperty, DatastoreProperty})
+	if err != nil {
+		glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] err after GetVMsInsideFolder: %+v", err)
+		return nil, err
+	}
+	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] GetVMsInsideFolder: %+v", vmMoList)
+	dsMorefs := make(map[int][]types.ManagedObjectReference)
+	for i, vmMo := range vmMoList {
+		if !strings.HasPrefix(vmMo.Name, DummyVMPrefixName) {
+			dsMorefs[i] = vmMo.Datastore
+			glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] i: %d and dsMorefs: %+v", i, dsMorefs[i])
+		}
+	}
+	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] dsMorefs: %+v", dsMorefs)
+	sharedDSMorefs := intersectMorefs(dsMorefs)
+	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] intersectMorefs: %+v", sharedDSMorefs)
+	if len(sharedDSMorefs) == 0 {
+		glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] No shared datastores found in the Kubernetes cluster")
+		return nil, fmt.Errorf("No shared datastores found in the Kubernetes cluster")
+	}
+	return sharedDSMorefs, nil
+}
+
+func intersectMorefs(args map[int][]types.ManagedObjectReference) []types.ManagedObjectReference {
+	arrLength := len(args)
+	tempMap := make(map[string]int)
+	tempArrayNew := make([]types.ManagedObjectReference, 0)
+	for _, arg := range args {
+		tempArr := arg
+		glog.V(1).Infof("balu - [intersectMorefs] tempArr starting: %+v", tempArr)
+		for idx := range tempArr {
+			if _, ok := tempMap[tempArr[idx].Value]; ok {
+				tempMap[tempArr[idx].Value]++
+				if tempMap[tempArr[idx].Value] == arrLength {
+					glog.V(1).Infof("balu - [intersectMorefs] tempArrayNew before: %+v", tempArrayNew)
+					glog.V(1).Infof("balu - [intersectMorefs] arg[idx]: %+v", arg[idx])
+					tempArrayNew = append(tempArrayNew, arg[idx])
+					glog.V(1).Infof("balu - [intersectMorefs] tempArrayNew after: %+v", tempArrayNew)
+				}
+			} else {
+				tempMap[tempArr[idx].Value] = 1
+			}
+		}
+	}
+	return tempArrayNew
+}
+
+// Get the folder object inside the datacenter.
+func (vs *VSphere) GetFolder(ctx context.Context, datacenterName string, folderName string) (*object.Folder, error) {
+	f := find.NewFinder(vs.client.Client, true)
+
+	// Fetch and set data center
+	dc, err := f.Datacenter(ctx, datacenterName)
+	if err != nil {
+		return nil, err
+	}
+	f.SetDatacenter(dc)
+
+	dcFolders, err := dc.Folders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	vmFolders, err := dcFolders.VmFolder.Children(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var resultFolder *object.Folder
+	pc := property.DefaultCollector(vs.client.Client)
+	var folderRefs []types.ManagedObjectReference
+	var folderMoList []mo.Folder
+	for _, vmFolder := range vmFolders {
+		if vmFolder.Reference().Type == Folder {
+			folderRefs = append(folderRefs, vmFolder.Reference())
+		}
+	}
+	err = pc.Retrieve(ctx, folderRefs, []string{NameProperty}, &folderMoList)
+	if err != nil {
+		return nil, err
+	}
+	for _, folderMo := range folderMoList {
+		if folderMo.Name == folderName {
+			resultFolder = object.NewFolder(vs.client.Client, folderMo.Reference())
+			return resultFolder, nil
+		}
+	}
+	return nil, fmt.Errorf("Folder :%q is not found in datacenter: %q", folderName, datacenterName)
+}
+
+// Get the VM list inside a folder.
+func (vs *VSphere) GetVMsInsideFolder(ctx context.Context, vmFolder *object.Folder, properties []string) ([]mo.VirtualMachine, error) {
+	vmFolders, err := vmFolder.Children(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	pc := property.DefaultCollector(vs.client.Client)
+	var vmRefs []types.ManagedObjectReference
+	var vmMoList []mo.VirtualMachine
+	for _, vmFolder := range vmFolders {
+		if vmFolder.Reference().Type == VirtualMachine {
+			vmRefs = append(vmRefs, vmFolder.Reference())
+		}
+	}
+	err = pc.Retrieve(ctx, vmRefs, properties, &vmMoList)
+	if err != nil {
+		return nil, err
+	}
+	return vmMoList, nil
+}
+
+// Get the datastores accessible for the virtual machine object.
 func (vs *VSphere) getAllAccessibleDatastores(ctx context.Context, vmObj *object.VirtualMachine) ([]types.ManagedObjectReference, error) {
 	host, err := vmObj.HostSystem(ctx)
 	if err != nil {
