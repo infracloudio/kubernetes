@@ -18,10 +18,12 @@ package vsphere
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/golang/glog"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/pbm"
@@ -33,8 +35,11 @@ import (
 )
 
 const (
-	DatastoreProperty     = "datastore"
-	DatastoreInfoProperty = "info"
+	DatastoreProperty      = "datastore"
+	DatastoreInfoProperty  = "info"
+	ParentProperty         = "parent"
+	ClusterComputeResource = "ClusterComputeResource"
+	ComputeResource        = "ComputeResource"
 )
 
 // Reads vSphere configuration from system environment and construct vSphere object
@@ -78,8 +83,8 @@ func GetgovmomiClient(cfg *VSphereConfig) (*govmomi.Client, error) {
 }
 
 // Get placement compatibility result based on storage policy requirements.
-func (vs *VSphere) GetPlacementCompatibilityResult(ctx context.Context, pbmClient *pbm.Client, vmObj *object.VirtualMachine, storagePolicyID string) (pbm.PlacementCompatibilityResult, error) {
-	datastores, err := vs.getAllAccessibleDatastores(ctx, vmObj)
+func (vs *VSphere) GetPlacementCompatibilityResult(ctx context.Context, pbmClient *pbm.Client, resourcePool *object.ResourcePool, storagePolicyID string) (pbm.PlacementCompatibilityResult, error) {
+	datastores, err := vs.getAllAccessibleDatastores(ctx, resourcePool)
 	if err != nil {
 		return nil, err
 	}
@@ -190,17 +195,104 @@ func (vs *VSphere) getDatastoreMo(ctx context.Context, hubs []pbmtypes.PbmPlacem
 }
 
 // Get all datastores accessible for the virtual machine object.
-func (vs *VSphere) getAllAccessibleDatastores(ctx context.Context, vmObj *object.VirtualMachine) ([]types.ManagedObjectReference, error) {
-	host, err := vmObj.HostSystem(ctx)
+func (vs *VSphere) getAllAccessibleDatastores(ctx context.Context, resourcePool *object.ResourcePool) ([]types.ManagedObjectReference, error) {
+	var datastores []types.ManagedObjectReference
+	resourcePoolMo, err := vs.getParentResourcePoolMo(ctx, resourcePool)
 	if err != nil {
 		return nil, err
 	}
-
-	var hostSystemMo mo.HostSystem
 	s := object.NewSearchIndex(vs.client.Client)
-	err = s.Properties(ctx, host.Reference(), []string{DatastoreProperty}, &hostSystemMo)
+	switch resourcePoolMo.Parent.Type {
+	case ClusterComputeResource:
+		var cluster mo.ClusterComputeResource
+		err := s.Properties(ctx, resourcePoolMo.Parent.Reference(), []string{DatastoreProperty}, &cluster)
+		if err != nil {
+			return nil, err
+		}
+		hostMoList, err := vs.getHostsMo(ctx, cluster.Host)
+		if err != nil {
+			return nil, err
+		}
+		datastores, err = vs.getSharedDatastoresFromHosts(ctx, hostMoList)
+		if err != nil {
+			return nil, err
+		}
+	case ComputeResource:
+		var host mo.ComputeResource
+		err := s.Properties(ctx, resourcePoolMo.Parent.Reference(), []string{DatastoreProperty}, &host)
+		if err != nil {
+			return nil, err
+		}
+		datastores = host.Datastore
+	default:
+		return nil, fmt.Errorf("Failed to get datastores - unknown parent type: %s", resourcePoolMo.Parent.Type)
+	}
+	return datastores, nil
+}
+
+func (vs *VSphere) getSharedDatastoresFromHosts(ctx context.Context, hostMoList []mo.HostSystem) ([]types.ManagedObjectReference, error) {
+	dsMorefs := make(map[int][]types.ManagedObjectReference)
+	for i, hostMo := range hostMoList {
+		dsMorefs[i] = hostMo.Datastore
+		glog.V(1).Infof("balu - [getSharedDatastoresFromHosts] i: %d and dsMorefs: %+v", i, dsMorefs[i])
+	}
+	glog.V(1).Infof("balu - [getSharedDatastoresFromHosts] dsMorefs: %+v", dsMorefs)
+	sharedDSMorefs := intersectMorefs(dsMorefs)
+	glog.V(1).Infof("balu - [getSharedDatastoresFromHosts] intersectMorefs: %+v", sharedDSMorefs)
+	if len(sharedDSMorefs) == 0 {
+		glog.V(1).Infof("balu - [getSharedDatastoresFromHosts] No shared datastores found in the Kubernetes cluster")
+		return nil, fmt.Errorf("No shared datastores found in the Kubernetes cluster")
+	}
+	return sharedDSMorefs, nil
+}
+
+func intersectMorefs(args map[int][]types.ManagedObjectReference) []types.ManagedObjectReference {
+	arrLength := len(args)
+	tempMap := make(map[string]int)
+	tempArrayNew := make([]types.ManagedObjectReference, 0)
+	for _, arg := range args {
+		tempArr := arg
+		glog.V(1).Infof("balu - [intersectMorefs] tempArr starting: %+v", tempArr)
+		for idx := range tempArr {
+			if _, ok := tempMap[tempArr[idx].Value]; ok {
+				tempMap[tempArr[idx].Value]++
+				if tempMap[tempArr[idx].Value] == arrLength {
+					glog.V(1).Infof("balu - [intersectMorefs] tempArrayNew before: %+v", tempArrayNew)
+					glog.V(1).Infof("balu - [intersectMorefs] arg[idx]: %+v", arg[idx])
+					tempArrayNew = append(tempArrayNew, arg[idx])
+					glog.V(1).Infof("balu - [intersectMorefs] tempArrayNew after: %+v", tempArrayNew)
+				}
+			} else {
+				tempMap[tempArr[idx].Value] = 1
+			}
+		}
+	}
+	return tempArrayNew
+}
+
+func (vs *VSphere) getHostsMo(ctx context.Context, refs []types.ManagedObjectReference) ([]mo.HostSystem, error) {
+	var hostMoList []mo.HostSystem
+	pc := property.DefaultCollector(vs.client.Client)
+	err := pc.Retrieve(ctx, refs, []string{DatastoreProperty}, &hostMoList)
 	if err != nil {
 		return nil, err
 	}
-	return hostSystemMo.Datastore, nil
+	return hostMoList, nil
+}
+
+func (vs *VSphere) getParentResourcePoolMo(ctx context.Context, resourcePool *object.ResourcePool) (*mo.ResourcePool, error) {
+	var resourcePoolMo mo.ResourcePool
+	var resourcePoolType string
+	s := object.NewSearchIndex(vs.client.Client)
+	for {
+		err := s.Properties(ctx, resourcePool.Reference(), []string{ParentProperty}, &resourcePoolMo)
+		if err != nil {
+			return nil, err
+		}
+		resourcePoolType = resourcePoolMo.Parent.Type
+		if resourcePoolType == ClusterComputeResource || resourcePoolType == ComputeResource {
+			break
+		}
+	}
+	return &resourcePoolMo, nil
 }

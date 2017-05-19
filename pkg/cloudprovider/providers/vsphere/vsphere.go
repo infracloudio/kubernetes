@@ -31,8 +31,6 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/gcfg.v1"
-
 	"github.com/golang/glog"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
@@ -1295,13 +1293,13 @@ func (vs *VSphere) CreateVolume(volumeOptions *VolumeOptions) (volumePath string
 			return "", err
 		}
 
-		vmRegex := vs.cfg.Global.WorkingDir + vs.localInstanceID
-		currentVM, err := f.VirtualMachine(ctx, vmRegex)
+		// Get the resource pool for current node.
+		resourcePool, err := vs.getCurrentNodeResourcePool(ctx, dc)
 		if err != nil {
 			return "", err
 		}
 
-		compatibilityResult, err := vs.GetPlacementCompatibilityResult(ctx, pbmClient, currentVM, volumeOptions.StoragePolicyID)
+		compatibilityResult, err := vs.GetPlacementCompatibilityResult(ctx, pbmClient, resourcePool, volumeOptions.StoragePolicyID)
 		if err != nil {
 			return "", err
 		}
@@ -1646,6 +1644,7 @@ func (vs *VSphere) getCurrentNodeResourcePool(ctx context.Context, datacenter *o
 
 	vmRegex := vs.cfg.Global.WorkingDir + vs.localInstanceID
 	currentVM, err := f.VirtualMachine(ctx, vmRegex)
+
 	if err != nil {
 		return nil, err
 	}
