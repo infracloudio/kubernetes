@@ -216,49 +216,50 @@ func (vs *VSphere) getSharedDatastoresInK8SCluster(ctx context.Context) ([]types
 		return nil, err
 	}
 	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] GetVMsInsideFolder: %+v", vmMoList)
-	dsMorefs := make(map[int][]types.ManagedObjectReference)
-	for i, vmMo := range vmMoList {
+	index := 0
+	var sharedDs []string
+	for _, vmMo := range vmMoList {
 		if !strings.HasPrefix(vmMo.Name, DummyVMPrefixName) {
-			dsMorefs[i], err = vs.getAllAccessibleDatastores(ctx, vmMo)
+			accessibleDatastores, err := vs.getAllAccessibleDatastores(ctx, vmMo)
 			if err != nil {
 				glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] getAllAccessibleDatastores failed with err: %+v", err)
 				return nil, err
 			}
-			glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] i: %d and dsMorefs: %+v", i, dsMorefs[i])
+			if index == 0 {
+				sharedDs = accessibleDatastores
+				glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] getAllAccessibleDatastores sharedDs: %+v", sharedDs)
+			} else {
+				sharedDs = intersect(sharedDs, accessibleDatastores)
+				glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] getAllAccessibleDatastores sharedDs: %+v", sharedDs)
+				if len(sharedDs) == 0 {
+					return nil, fmt.Errorf("No shared datastores found in the Kubernetes cluster")
+				}
+			}
+			index++
 		}
 	}
-	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] dsMorefs: %+v", dsMorefs)
-	sharedDSMorefs := intersectMorefs(dsMorefs)
-	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] intersectMorefs: %+v", sharedDSMorefs)
-	if len(sharedDSMorefs) == 0 {
-		glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] No shared datastores found in the Kubernetes cluster")
-		return nil, fmt.Errorf("No shared datastores found in the Kubernetes cluster")
+	var sharedDSMorefs []types.ManagedObjectReference
+	for _, ds := range sharedDs {
+		sharedDSMorefs = append(sharedDSMorefs, types.ManagedObjectReference{
+			Value: ds,
+			Type:  DatastoreProperty,
+		})
 	}
+	glog.V(1).Infof("balu - [getSharedDatastoresInK8SCluster] sharedDSMorefs: %+v", sharedDSMorefs)
 	return sharedDSMorefs, nil
 }
 
-func intersectMorefs(args map[int][]types.ManagedObjectReference) []types.ManagedObjectReference {
-	arrLength := len(args)
-	tempMap := make(map[string]int)
-	tempArrayNew := make([]types.ManagedObjectReference, 0)
-	for _, arg := range args {
-		tempArr := arg
-		glog.V(1).Infof("balu - [intersectMorefs] tempArr starting: %+v", tempArr)
-		for idx := range tempArr {
-			if _, ok := tempMap[tempArr[idx].Value]; ok {
-				tempMap[tempArr[idx].Value]++
-				if tempMap[tempArr[idx].Value] == arrLength {
-					glog.V(1).Infof("balu - [intersectMorefs] tempArrayNew before: %+v", tempArrayNew)
-					glog.V(1).Infof("balu - [intersectMorefs] arg[idx]: %+v", arg[idx])
-					tempArrayNew = append(tempArrayNew, arg[idx])
-					glog.V(1).Infof("balu - [intersectMorefs] tempArrayNew after: %+v", tempArrayNew)
-				}
-			} else {
-				tempMap[tempArr[idx].Value] = 1
+func intersect(list1 []string, list2 []string) []string {
+	var sharedList []string
+	for _, val1 := range list1 {
+		for _, val2 := range list2 {
+			if val1 == val2 {
+				sharedList = append(sharedList, val1)
+				break
 			}
 		}
 	}
-	return tempArrayNew
+	return sharedList
 }
 
 // Get the VM list inside a folder.
@@ -284,7 +285,7 @@ func (vs *VSphere) GetVMsInsideFolder(ctx context.Context, vmFolder *object.Fold
 }
 
 // Get the datastores accessible for the virtual machine object.
-func (vs *VSphere) getAllAccessibleDatastores(ctx context.Context, vmMo mo.VirtualMachine) ([]types.ManagedObjectReference, error) {
+func (vs *VSphere) getAllAccessibleDatastores(ctx context.Context, vmMo mo.VirtualMachine) ([]string, error) {
 	f := find.NewFinder(vs.client.Client, true)
 	dc, err := f.Datacenter(ctx, vs.cfg.Global.Datacenter)
 	if err != nil {
@@ -310,5 +311,9 @@ func (vs *VSphere) getAllAccessibleDatastores(ctx context.Context, vmMo mo.Virtu
 	if err != nil {
 		return nil, err
 	}
-	return hostSystemMo.Datastore, nil
+	var dsRefValues []string
+	for _, dsRef := range hostSystemMo.Datastore {
+		dsRefValues = append(dsRefValues, dsRef.Value)
+	}
+	return dsRefValues, nil
 }
